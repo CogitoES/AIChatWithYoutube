@@ -4,6 +4,7 @@
 
 # dependencies
 node_modules
+/server/data
 /.pnp
 .pnp.js
 

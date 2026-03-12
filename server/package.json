@@ -17,8 +17,11 @@
     "@langchain/google-genai": "^2.1.25",
     "@langchain/langgraph": "^1.2.2",
     "@langchain/openai": "^1.2.13",
+    "@langchain/textsplitters": "^1.0.1",
     "dotenv": "^17.3.1",
+    "googleapis": "^171.4.0",
     "langchain": "^1.2.31",
+    "youtube-transcript-plus": "^1.2.0",
     "zod": "^4.3.6"
   }
 }
