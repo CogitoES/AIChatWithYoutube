@@ -98,4 +98,88 @@ export async function getVideoDetails(urlOrId) {
         console.error('Error fetching YouTube data:', error.message);
         throw error;
     }
+}/**
+ * Formats seconds into MM:SS or HH:MM:SS
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatTime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return [
+        h > 0 ? h : null,
+        m.toString().padStart(2, '0'),
+        s.toString().padStart(2, '0')
+    ].filter(Boolean).join(':');
 }
+/**
+ * Loads video data and splits transcription into timestamped chunks.
+ * Uses a sliding window approach to preserve context and timestamps.
+ * @param {string} urlOrId - The YouTube URL or video ID.
+ * @param {number} targetLength - Approximate character length for each chunk.
+ * @param {number} overlap - Number of seconds to overlap between chunks.
+ * @returns {Promise<Array>} - Array of chunk objects with text and offset.
+ */
+export async function getTranscriptChunks(urlOrId, targetLength = 1000, overlapLines = 2) {
+    const videoId = extractVideoId(urlOrId);
+    if (!videoId) throw new Error("Invalid YouTube ID or URL");
+
+    // 1. Try to load from local storage
+    let data = loadVideoData(videoId);
+
+    if (!data) {
+        console.log(`Transcript not found in cache for ${videoId}. Fetching...`);
+        data = await getVideoDetails(videoId);
+        saveVideoData(videoId, data);
+    } else {
+        console.log(`Loaded transcript from local cache for ${videoId}.`);
+    }
+
+    if (!data.transcription || data.transcription.length === 0) {
+        throw new Error("No transcription available for this video.");
+    }
+
+    const snippets = data.transcription;
+    const chunks = [];
+
+    // 2. Aggregate snippets into chunks
+    let currentChunkText = "";
+    let currentStartOffset = snippets[0].offset;
+    let snippetCount = 0;
+
+    for (let i = 0; i < snippets.length; i++) {
+        const snippet = snippets[i];
+
+        if (currentChunkText === "") {
+            currentStartOffset = snippet.offset;
+        }
+
+        currentChunkText += (currentChunkText ? " " : "") + snippet.text;
+        snippetCount++;
+
+        // If chunk is large enough, push it and start next one with overlap
+        if (currentChunkText.length >= targetLength || i === snippets.length - 1) {
+            chunks.push({
+                pageContent: currentChunkText.replace(/\n/g, " "),
+                metadata: {
+                    video_id: videoId,
+                    offset: Math.floor(currentStartOffset),
+                    timestamp: formatTime(currentStartOffset)
+                }
+            });
+
+            // Handle overlap: go back a few snippets if possible
+            if (i < snippets.length - 1) {
+                const backStep = Math.min(overlapLines, snippetCount - 1);
+                i -= backStep;
+            }
+
+            currentChunkText = "";
+            snippetCount = 0;
+        }
+    }
+
+    return chunks;
+}
+

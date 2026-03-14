@@ -1,10 +1,11 @@
 import { ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { createAgent } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import "dotenv/config";
-import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
-import { loadVideoData, saveVideoData, getVideoDetails, extractVideoId } from "./youtube.js";
+import { NeonPostgres } from "@langchain/community/vectorstores/neon";
+import { getTranscriptChunks } from "./youtube.js";
 
 //model should be gemini-2.5-flash
 const llm = new ChatGoogleGenerativeAI({
@@ -19,93 +20,15 @@ const embeddings = new GoogleGenerativeAIEmbeddings({
     apiKey: process.env.GOOGLE_API_KEY,
 });
 
+const checkpointer = new MemorySaver();
+
 let vectorStore = null;
 
-/**
- * Loads video data and splits transcription into timestamped chunks.
- * Uses a sliding window approach to preserve context and timestamps.
- * @param {string} urlOrId - The YouTube URL or video ID.
- * @param {number} targetLength - Approximate character length for each chunk.
- * @param {number} overlap - Number of seconds to overlap between chunks.
- * @returns {Promise<Array>} - Array of chunk objects with text and offset.
- */
-async function getTranscriptChunks(urlOrId, targetLength = 1000, overlapLines = 2) {
-    const videoId = extractVideoId(urlOrId);
-    if (!videoId) throw new Error("Invalid YouTube ID or URL");
-
-    // 1. Try to load from local storage
-    let data = loadVideoData(videoId);
-
-    if (!data) {
-        console.log(`Transcript not found in cache for ${videoId}. Fetching...`);
-        data = await getVideoDetails(videoId);
-        saveVideoData(videoId, data);
-    } else {
-        console.log(`Loaded transcript from local cache for ${videoId}.`);
-    }
-
-    if (!data.transcription || data.transcription.length === 0) {
-        throw new Error("No transcription available for this video.");
-    }
-
-    const snippets = data.transcription;
-    const chunks = [];
-
-    // 2. Aggregate snippets into chunks
-    let currentChunkText = "";
-    let currentStartOffset = snippets[0].offset;
-    let snippetCount = 0;
-
-    for (let i = 0; i < snippets.length; i++) {
-        const snippet = snippets[i];
-
-        if (currentChunkText === "") {
-            currentStartOffset = snippet.offset;
-        }
-
-        currentChunkText += (currentChunkText ? " " : "") + snippet.text;
-        snippetCount++;
-
-        // If chunk is large enough, push it and start next one with overlap
-        if (currentChunkText.length >= targetLength || i === snippets.length - 1) {
-            chunks.push({
-                pageContent: currentChunkText.replace(/\n/g, " "),
-                metadata: {
-                    video_id: videoId,
-                    offset: Math.floor(currentStartOffset),
-                    timestamp: formatTime(currentStartOffset)
-                }
-            });
-
-            // Handle overlap: go back a few snippets if possible
-            if (i < snippets.length - 1) {
-                const backStep = Math.min(overlapLines, snippetCount - 1);
-                i -= backStep;
-            }
-
-            currentChunkText = "";
-            snippetCount = 0;
-        }
-    }
-
-    return chunks;
-}
-
-/**
- * Formats seconds into MM:SS or HH:MM:SS
- * @param {number} seconds 
- * @returns {string}
- */
-function formatTime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    return [
-        h > 0 ? h : null,
-        m.toString().padStart(2, '0'),
-        s.toString().padStart(2, '0')
-    ].filter(Boolean).join(':');
-}
+const dbConfig = {
+    connectionString: process.env.DB_URL,
+    tableName: "video_embeddings",
+    distanceStrategy: "cosine",
+};
 
 // 1. Define custom tools the agent can use
 
@@ -138,10 +61,11 @@ const searchTranscriptTool = tool(
     }
 );
 
-// 2. Initialize the pre-built specific React agent from LangGraph
-const agent = createReactAgent({
-    llm,
+// 2. Initialize the agent using createAgent from langchain/agents
+const agent = createAgent({
+    model: llm,
     tools: [searchTranscriptTool],
+    checkpointer,
 });
 
 async function main() {
@@ -149,16 +73,28 @@ async function main() {
 
     try {
         console.log("Processing YouTube Video...");
-        const chunks = await getTranscriptChunks(videoUrl);
+        const videoId = videoUrl.split("v=")[1]?.split("&")[0];
+        
+        // Initialize NeonPostgres
+        vectorStore = await NeonPostgres.initialize(embeddings, {
+            ...dbConfig,
+            filter: { video_id: videoId },
+        });
 
-        console.log(`\nProcessed ${chunks.length} chunks. Initializing vector store...`);
-
-        // Initialize MemoryVectorStore with the chunks and Gemini embeddings
-        vectorStore = await MemoryVectorStore.fromTexts(
-            chunks.map(c => c.pageContent),
-            chunks.map(c => c.metadata),
-            embeddings
-        );
+        // Check if we need to index
+        // We can do a simple similarity search or just try to see if any docs exist with this video_id
+        // NeonPostgres doesn't have a direct "count" but we can try to search
+        const existingDocs = await vectorStore.similaritySearch("the", 1);
+        
+        if (existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId) {
+            console.log(`Transcript for video ${videoId} already indexed in Neon. Skipping...`);
+        } else {
+            console.log(`\nIndexing transcript for video ${videoId} into Neon...`);
+            const chunks = await getTranscriptChunks(videoUrl);
+            
+            await vectorStore.addDocuments(chunks);
+            console.log(`Successfully indexed ${chunks.length} chunks.`);
+        }
 
         console.log("Vector store ready. Running agent query...");
 
@@ -168,11 +104,24 @@ async function main() {
             ],
         };
 
-        const result = await agent.invoke(input);
-        const lastMessage = result.messages[result.messages.length - 1];
+        const config = { configurable: { thread_id: "youtube-chat-1" } };
 
-        console.log("\n--- Agent Response ---");
-        console.log(lastMessage.content);
+        console.log("Query 1: Asking about the pirate...");
+        const result1 = await agent.invoke(input, config);
+        console.log("\n--- Agent Response 1 ---");
+        console.log(result1.messages[result1.messages.length - 1].content);
+
+        // Second query to test memory
+        const input2 = {
+            messages: [
+                { role: "user", content: "Wait, I forgot, what was her name again? Just the name." }
+            ],
+        };
+
+        console.log("\nQuery 2: Testing memory (asking for the name again)...");
+        const result2 = await agent.invoke(input2, config);
+        console.log("\n--- Agent Response 2 ---");
+        console.log(result2.messages[result2.messages.length - 1].content);
 
     } catch (err) {
         console.error("Failed:", err.message);
