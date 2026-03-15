@@ -68,64 +68,57 @@ const agent = createAgent({
     checkpointer,
 });
 
-async function main() {
-    const videoUrl = "https://www.youtube.com/watch?v=y2lkVlB96y4";
-
+export async function chatWithVideo(videoId, prompt, threadId) {
     try {
-        console.log("Processing YouTube Video...");
-        const videoId = videoUrl.split("v=")[1]?.split("&")[0];
+        console.log(`\n--- Chatting with Video ID: ${videoId} ---`);
         
-        // Initialize NeonPostgres
+        // Initialize NeonPostgres if not already done or if videoId changed
+        // For simplicity in this session, we re-initialize/filter each time
+        // In a production app, you might cache vectorStores per videoId
         vectorStore = await NeonPostgres.initialize(embeddings, {
             ...dbConfig,
             filter: { video_id: videoId },
         });
 
-        // Check if we need to index
-        // We can do a simple similarity search or just try to see if any docs exist with this video_id
-        // NeonPostgres doesn't have a direct "count" but we can try to search
         const existingDocs = await vectorStore.similaritySearch("the", 1);
         
-        if (existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId) {
-            console.log(`Transcript for video ${videoId} already indexed in Neon. Skipping...`);
-        } else {
+        if (!(existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId)) {
             console.log(`\nIndexing transcript for video ${videoId} into Neon...`);
+            const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
             const chunks = await getTranscriptChunks(videoUrl);
             
             await vectorStore.addDocuments(chunks);
             console.log(`Successfully indexed ${chunks.length} chunks.`);
         }
 
-        console.log("Vector store ready. Running agent query...");
-
         const input = {
-            messages: [
-                { role: "user", content: "Who was the most powerful pirate in this video and what was her name? Also, what happened at around 8 minutes in the video?" }
-            ],
+            messages: [{ role: "user", content: prompt }],
         };
 
-        const config = { configurable: { thread_id: "youtube-chat-1" } };
+        const config = { configurable: { thread_id: threadId } };
 
-        console.log("Query 1: Asking about the pirate...");
-        const result1 = await agent.invoke(input, config);
-        console.log("\n--- Agent Response 1 ---");
-        console.log(result1.messages[result1.messages.length - 1].content);
+        const response = await agent.invoke(input, config);
+        const lastMessage = response.messages[response.messages.length - 1];
+        
+        // Extract timestamp from metadata if available in the first retrieval
+        // This is a bit tricky as agent.invoke doesn't directly return the raw tool output metadata
+        // For now, we'll look for [Timestamp: X] in the content or return a neutral 0 if not found
+        const timestampMatch = lastMessage.content.match(/\[Timestamp:\s*(\d+:\d+)\]/);
+        let timestampSeconds = 0;
+        if (timestampMatch) {
+            const parts = timestampMatch[1].split(':');
+            timestampSeconds = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+        }
 
-        // Second query to test memory
-        const input2 = {
-            messages: [
-                { role: "user", content: "Wait, I forgot, what was her name again? Just the name." }
-            ],
+        return {
+            answer: lastMessage.content,
+            timestamp: timestampSeconds,
+            video_id: videoId,
+            thread_id: threadId
         };
-
-        console.log("\nQuery 2: Testing memory (asking for the name again)...");
-        const result2 = await agent.invoke(input2, config);
-        console.log("\n--- Agent Response 2 ---");
-        console.log(result2.messages[result2.messages.length - 1].content);
 
     } catch (err) {
-        console.error("Failed:", err.message);
+        console.error("Chat Error:", err.message);
+        throw err;
     }
 }
-
-main();
