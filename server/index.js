@@ -46,3 +46,6 @@ app.post("/chat", async (req, res) => {
 app.listen(port, () => {
     console.log(`AIChatWithYoutube API listening at http://localhost:${port}`);
 });
+
+// Force process to stay alive if something is closing it prematurely
+setInterval(() => {}, 1000000);

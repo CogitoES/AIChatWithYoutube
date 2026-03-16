@@ -42,15 +42,21 @@ const searchTranscriptTool = tool(
         }
 
         console.log(`Searching transcript for: "${query}"...`);
-        const results = await vectorStore.similaritySearch(query, 3);
+        try {
+            const results = await vectorStore.similaritySearch(query, 3);
+            console.log(`Search complete. Found ${results.length} results.`);
 
-        if (results.length === 0) {
-            return "No relevant segments found in the video transcript.";
+            if (results.length === 0) {
+                return "No relevant segments found in the video transcript.";
+            }
+
+            return results.map(res =>
+                `\n[Timestamp: ${res.metadata.timestamp}] (Offset: ${res.metadata.offset}s)\nContent: ${res.pageContent}`
+            ).join("\n---\n");
+        } catch (searchError) {
+            console.error("Similarity Search Error:", searchError);
+            return `Error during search: ${searchError.message}`;
         }
-
-        return results.map(res =>
-            `\n[Timestamp: ${res.metadata.timestamp}] (Offset: ${res.metadata.offset}s)\nContent: ${res.pageContent}`
-        ).join("\n---\n");
     },
     {
         name: "search_video_transcript",
@@ -71,22 +77,28 @@ const agent = createAgent({
 export async function chatWithVideo(videoId, prompt, threadId) {
     try {
         console.log(`\n--- Chatting with Video ID: ${videoId} ---`);
-        
-        // Initialize NeonPostgres if not already done or if videoId changed
-        // For simplicity in this session, we re-initialize/filter each time
-        // In a production app, you might cache vectorStores per videoId
-        vectorStore = await NeonPostgres.initialize(embeddings, {
-            ...dbConfig,
-            filter: { video_id: videoId },
-        });
 
-        const existingDocs = await vectorStore.similaritySearch("the", 1);
-        
+        if (!vectorStore || vectorStore.tableName !== videoId) { // Using tableName as a marker for simplicity or a custom flag
+            console.log("Initializing Vector Store...");
+            vectorStore = await NeonPostgres.initialize(embeddings, {
+                ...dbConfig,
+                filter: { video_id: videoId },
+            });
+            console.log("Vector Store Initialized.");
+        } else {
+            console.log("Reusing existing Vector Store.");
+        }
+
+        // Check if documents for this videoId already exist in the vector store
+        // This is a placeholder for a more robust check.
+        // In a real application, you might query the vector store metadata or a separate database.
+        const existingDocs = await vectorStore.similaritySearch("dummy query", 1, { video_id: videoId });
+
         if (!(existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId)) {
             console.log(`\nIndexing transcript for video ${videoId} into Neon...`);
             const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
             const chunks = await getTranscriptChunks(videoUrl);
-            
+
             await vectorStore.addDocuments(chunks);
             console.log(`Successfully indexed ${chunks.length} chunks.`);
         }
@@ -97,9 +109,12 @@ export async function chatWithVideo(videoId, prompt, threadId) {
 
         const config = { configurable: { thread_id: threadId } };
 
+        console.log("Invoking agent...");
         const response = await agent.invoke(input, config);
+        console.log("Agent response received.");
+
         const lastMessage = response.messages[response.messages.length - 1];
-        
+
         // Extract timestamp from metadata if available in the first retrieval
         // This is a bit tricky as agent.invoke doesn't directly return the raw tool output metadata
         // For now, we'll look for [Timestamp: X] in the content or return a neutral 0 if not found
@@ -118,7 +133,7 @@ export async function chatWithVideo(videoId, prompt, threadId) {
         };
 
     } catch (err) {
-        console.error("Chat Error:", err.message);
+        console.error("Chat Error Detail:", err);
         throw err;
     }
 }
