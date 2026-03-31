@@ -86,17 +86,25 @@ export async function getVideoDetails(urlOrId) {
         // 2. Fetch Transcription
         console.log(`Fetching transcript for ${videoId}...`);
         try {
-            const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+            const transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
             video.transcription = transcript;
         } catch (transcriptError) {
-            console.warn(`Warning: Could not fetch transcript: ${transcriptError.message}`);
-            video.transcription = null; // Or [] if you prefer
+            console.warn(`Warning: Could not fetch English transcript for ${videoId}: ${transcriptError.message}`);
+            console.log("Attempting to fetch any available transcript...");
+            try {
+                const anyTranscript = await YoutubeTranscript.fetchTranscript(videoId);
+                video.transcription = anyTranscript;
+                console.log("Fetched non-English or default transcript.");
+            } catch (anyError) {
+                console.error(`Final transcript fetch failed: ${anyError.message}`);
+                video.transcription = null;
+            }
         }
 
         return video;
     } catch (error) {
         console.error('Error fetching YouTube data:', error.message);
-        throw error;
+        throw new Error(`Failed to retrieve video data: ${error.message}`);
     }
 }/**
  * Formats seconds into MM:SS or HH:MM:SS

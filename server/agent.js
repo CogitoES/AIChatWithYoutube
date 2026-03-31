@@ -6,10 +6,14 @@ import { z } from "zod";
 import "dotenv/config";
 import { NeonPostgres } from "@langchain/community/vectorstores/neon";
 import { getTranscriptChunks } from "./youtube.js";
+import { SystemMessage, HumanMessage } from "@langchain/core/messages";
 
-//model should be gemini-2.5-flash
+// Global state for tool and vector store
+let vectorStore = null;
+let currentVideoId = null;
+
 const llm = new ChatGoogleGenerativeAI({
-    model: "gemini-2.5-flash",
+    model: "gemini-3-flash-preview",
     apiKey: process.env.GOOGLE_API_KEY,
     temperature: 0,
 });
@@ -22,15 +26,11 @@ const embeddings = new GoogleGenerativeAIEmbeddings({
 
 const checkpointer = new MemorySaver();
 
-let vectorStore = null;
-
 const dbConfig = {
     connectionString: process.env.DB_URL,
     tableName: "video_embeddings",
     distanceStrategy: "cosine",
 };
-
-// 1. Define custom tools the agent can use
 
 /**
  * Tool for searching the video transcript.
@@ -41,13 +41,14 @@ const searchTranscriptTool = tool(
             return "Error: No video transcript loaded. Please provide a YouTube URL first.";
         }
 
-        console.log(`Searching transcript for: "${query}"...`);
+        console.log(`Searching transcript for: "${query}" (Video: ${currentVideoId})...`);
         try {
-            const results = await vectorStore.similaritySearch(query, 3);
+            // CRITICAL: Filter results by video_id to ensure context accuracy
+            const results = await vectorStore.similaritySearch(query, 5, { video_id: currentVideoId });
             console.log(`Search complete. Found ${results.length} results.`);
 
             if (results.length === 0) {
-                return "No relevant segments found in the video transcript.";
+                return `No relevant segments found in the transcript for video ${currentVideoId}.`;
             }
 
             return results.map(res =>
@@ -77,22 +78,16 @@ const agent = createAgent({
 export async function chatWithVideo(videoId, prompt, threadId) {
     try {
         console.log(`\n--- Chatting with Video ID: ${videoId} ---`);
+        currentVideoId = videoId; // Set current video context for tools
 
-        if (!vectorStore || vectorStore.tableName !== videoId) { // Using tableName as a marker for simplicity or a custom flag
+        if (!vectorStore || vectorStore.tableName !== "video_embeddings") {
             console.log("Initializing Vector Store...");
-            vectorStore = await NeonPostgres.initialize(embeddings, {
-                ...dbConfig,
-                filter: { video_id: videoId },
-            });
+            vectorStore = await NeonPostgres.initialize(embeddings, dbConfig);
             console.log("Vector Store Initialized.");
-        } else {
-            console.log("Reusing existing Vector Store.");
         }
 
         // Check if documents for this videoId already exist in the vector store
-        // This is a placeholder for a more robust check.
-        // In a real application, you might query the vector store metadata or a separate database.
-        const existingDocs = await vectorStore.similaritySearch("dummy query", 1, { video_id: videoId });
+        const existingDocs = await vectorStore.similaritySearch("the", 1, { video_id: videoId });
 
         if (!(existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId)) {
             console.log(`\nIndexing transcript for video ${videoId} into Neon...`);
@@ -101,28 +96,48 @@ export async function chatWithVideo(videoId, prompt, threadId) {
 
             await vectorStore.addDocuments(chunks);
             console.log(`Successfully indexed ${chunks.length} chunks.`);
+        } else {
+            console.log(`Knowledge found for video ${videoId}. Reusing existing index.`);
         }
 
-        const input = {
-            messages: [{ role: "user", content: prompt }],
-        };
-
         const config = { configurable: { thread_id: threadId } };
+        const state = await agent.getState(config);
+        const history = state.values?.messages || [];
+        const hasHistory = history.length > 0;
+
+        console.log(`\nThread ID: ${threadId}`);
+        console.log(`Existing history length: ${history.length}`);
+
+        const inputMessages = [];
+        if (!hasHistory) {
+            console.log("No history found. Adding system instruction for new thread.");
+            inputMessages.push(new SystemMessage({
+                content: `You are a specialized AI analyzer for YouTube videos. 
+                - LATEST VIDEO ID: ${videoId}
+                - A searchable transcript is AVAILABLE via the 'search_video_transcript' tool.
+                - ALWAYS use the tool before answering questions about the video content.
+                - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.
+                - If the search tool returns no results, state that the transcript does not seem to contain specific info about the query.`
+            }));
+        }
+
+        inputMessages.push(new HumanMessage({ content: prompt }));
 
         console.log("Invoking agent...");
-        const response = await agent.invoke(input, config);
+        const response = await agent.invoke({ messages: inputMessages }, config);
         console.log("Agent response received.");
 
-        const lastMessage = response.messages[response.messages.length - 1];
+        const outputMessages = response.messages;
+        const lastMessage = outputMessages[outputMessages.length - 1];
 
-        // Extract timestamp from metadata if available in the first retrieval
-        // This is a bit tricky as agent.invoke doesn't directly return the raw tool output metadata
-        // For now, we'll look for [Timestamp: X] in the content or return a neutral 0 if not found
-        const timestampMatch = lastMessage.content.match(/\[Timestamp:\s*(\d+:\d+)\]/);
-        let timestampSeconds = 0;
+        // Search for [Timestamp: HH:MM:SS] or [Timestamp: MM:SS]
+        const timestampMatch = lastMessage.content.match(/\[Timestamp:\s*(?:(\d+):)?(\d+):(\d+)\]/);
+        let timestampSeconds = undefined;
         if (timestampMatch) {
-            const parts = timestampMatch[1].split(':');
-            timestampSeconds = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+            const h = timestampMatch[1] ? parseInt(timestampMatch[1]) : 0;
+            const m = parseInt(timestampMatch[2]);
+            const s = parseInt(timestampMatch[3]);
+            timestampSeconds = h * 3600 + m * 60 + s;
         }
 
         return {
