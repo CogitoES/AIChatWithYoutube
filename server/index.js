@@ -30,6 +30,7 @@ app.post("/chat", async (req, res) => {
         res.json({
             answer: result.answer,
             timestamp: result.timestamp,
+            suggestions: result.suggestions ?? [],
             video_id: result.video_id,
             thread_id: result.thread_id,
             server_timestamp: new Date().toISOString()

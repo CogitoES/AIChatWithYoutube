@@ -8,6 +8,7 @@ interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp?: number
+  suggestions?: string[]
   id?: string
 }
 
@@ -65,21 +66,21 @@ function App() {
   }
 
 
-  const handleSendMessage = async () => {
-    if (!input.trim() || !activeVideoId || isLoading) return
+  const sendMessage = async (text: string) => {
+    if (!text.trim() || !activeVideoId || isLoading) return
 
-    const prompt = input
-    const userMsg: Message = { role: 'user', content: prompt }
+    const userMsg: Message = { role: 'user', content: text }
     setMessages(prev => [...prev, userMsg])
     setInput('')
     setIsLoading(true)
 
     try {
-      const data = await sendChatMessage(activeVideoId, prompt, threadId)
+      const data = await sendChatMessage(activeVideoId, text, threadId)
       const assistantMsg: Message = {
         role: 'assistant',
         content: data.answer,
-        timestamp: data.timestamp
+        timestamp: data.timestamp,
+        suggestions: data.suggestions ?? []
       }
       setMessages(prev => [...prev, assistantMsg])
     } catch (error: any) {
@@ -91,6 +92,8 @@ function App() {
       setIsLoading(false)
     }
   }
+
+  const handleSendMessage = () => sendMessage(input)
 
   const jumpToTimestamp = (seconds: number) => {
     const player = playerRef.current;
@@ -235,7 +238,19 @@ function App() {
                 <div className="text-[14px] leading-relaxed whitespace-pre-wrap">
                   {msg.role === 'assistant' ? renderMessageContent(msg.content) : msg.content}
                 </div>
-
+                {msg.role === 'assistant' && msg.suggestions && msg.suggestions.length > 0 && (
+                  <div className="mt-3 pt-3 border-t border-purple-800/30 flex flex-col gap-1.5">
+                    {msg.suggestions.map((q, qi) => (
+                      <button
+                        key={qi}
+                        onClick={() => sendMessage(q)}
+                        className="text-left text-xs px-3 py-2 rounded-lg border border-violet-500/30 bg-violet-500/10 hover:bg-violet-500/25 text-violet-300 transition-all hover:border-violet-400/50 leading-snug"
+                      >
+                        💬 {q}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           ))}

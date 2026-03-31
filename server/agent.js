@@ -140,9 +140,33 @@ export async function chatWithVideo(videoId, prompt, threadId) {
             timestampSeconds = h * 3600 + m * 60 + s;
         }
 
+        // Generate 3 suggested follow-up questions
+        let suggestions = [];
+        try {
+            const suggestionPrompt = `Based on this YouTube video (ID: ${videoId}) and the following AI answer, generate exactly 3 short follow-up questions a user might want to ask next.
+            
+AI Answer: ${lastMessage.content}
+
+Rules:
+- Return ONLY a JSON array of 3 strings, nothing else.
+- Each question must be concise (max 12 words).
+- Questions should explore different angles of the video content.
+- Do NOT repeat the original question.
+
+Example format: ["Question one?", "Question two?", "Question three?"]`;
+
+            const suggestionResponse = await llm.invoke([new HumanMessage({ content: suggestionPrompt })]);
+            const raw = suggestionResponse.content.trim().replace(/```json|```/g, '').trim();
+            suggestions = JSON.parse(raw);
+            if (!Array.isArray(suggestions)) suggestions = [];
+        } catch (e) {
+            console.warn("Could not generate suggestions:", e.message);
+        }
+
         return {
             answer: lastMessage.content,
             timestamp: timestampSeconds,
+            suggestions,
             video_id: videoId,
             thread_id: threadId
         };
