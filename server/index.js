@@ -37,9 +37,14 @@ app.post("/chat", async (req, res) => {
         });
     } catch (error) {
         console.error("API Error:", error.message);
-        res.status(500).json({
-            error: "An error occurred while processing your request.",
-            details: error.message
+        
+        const isQuotaError = error.message?.includes("429") || error.message?.toLowerCase().includes("quota");
+        
+        res.status(isQuotaError ? 429 : 500).json({
+            error: isQuotaError ? "AI Quota Reached" : "An error occurred while processing your request.",
+            details: isQuotaError 
+                ? "The AI's daily free-tier limit has been reached. Please try again in a few hours or tomorrow." 
+                : error.message
         });
     }
 });

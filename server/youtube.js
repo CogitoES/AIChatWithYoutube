@@ -126,10 +126,10 @@ export function formatTime(seconds) {
  * Uses a sliding window approach to preserve context and timestamps.
  * @param {string} urlOrId - The YouTube URL or video ID.
  * @param {number} targetLength - Approximate character length for each chunk.
- * @param {number} overlap - Number of seconds to overlap between chunks.
+ * @param {number} overlapLines - Number of snippets to overlap between chunks.
  * @returns {Promise<Array>} - Array of chunk objects with text and offset.
  */
-export async function getTranscriptChunks(urlOrId, targetLength = 1000, overlapLines = 2) {
+export async function getTranscriptChunks(urlOrId, targetLength = 500, overlapLines = 2) {
     const videoId = extractVideoId(urlOrId);
     if (!videoId) throw new Error("Invalid YouTube ID or URL");
 
@@ -163,7 +163,9 @@ export async function getTranscriptChunks(urlOrId, targetLength = 1000, overlapL
             currentStartOffset = snippet.offset;
         }
 
-        currentChunkText += (currentChunkText ? " " : "") + snippet.text;
+        // Add inline timestamp [MM:SS] for every snippet to provide precise context to LLM
+        const timeStr = `[${formatTime(snippet.offset)}]`;
+        currentChunkText += (currentChunkText ? " " : "") + timeStr + " " + snippet.text;
         snippetCount++;
 
         // If chunk is large enough, push it and start next one with overlap
@@ -173,7 +175,8 @@ export async function getTranscriptChunks(urlOrId, targetLength = 1000, overlapL
                 metadata: {
                     video_id: videoId,
                     offset: Math.floor(currentStartOffset),
-                    timestamp: formatTime(currentStartOffset)
+                    timestamp: formatTime(currentStartOffset),
+                    format_version: "v2" // Mark as precision format
                 }
             });
 

@@ -84,9 +84,10 @@ function App() {
       }
       setMessages(prev => [...prev, assistantMsg])
     } catch (error: any) {
+      const errorMsg = error.response?.data?.details || error.response?.data?.error || error.message || 'Failed to get answer from AI';
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Error: ${error.response?.data?.details || error.message || 'Failed to get answer from AI'}`
+        content: `⚠️ ${errorMsg}`
       }])
     } finally {
       setIsLoading(false)
@@ -115,29 +116,39 @@ function App() {
   }
 
   const renderMessageContent = (content: string) => {
-    // Regex for [Timestamp: HH:MM:SS] or [Timestamp: MM:SS]
-    const parts = content.split(/(\[Timestamp:\s*(?:\d+:)?\d+:\d+\])/g);
+    // Regex for [Timestamp: HH:MM:SS, MM:SS, ...]
+    const parts = content.split(/(\[Timestamp:\s*[^\]]+\])/gi);
+    let foundFirst = false;
 
     return parts.map((part, i) => {
-      const match = part.match(/\[Timestamp:\s*(?:(\d+):)?(\d+):(\d+)\]/);
-      if (match) {
-        const h = match[1] ? parseInt(match[1]) : 0;
-        const m = parseInt(match[2]);
-        const s = parseInt(match[3]);
-        const totalSeconds = h * 3600 + m * 60 + s;
-        const displayTime = `${match[1] ? match[1] + ':' : ''}${match[2]}:${match[3]}`;
+      const tagMatch = part.match(/\[Timestamp:\s*([^\]]+)\]/i);
 
-        return (
-          <button
-            key={i}
-            onClick={() => jumpToTimestamp(totalSeconds)}
-            className="inline-flex items-center gap-1 mx-1 px-2 py-0.5 rounded-md bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-bold text-xs transition-colors border border-violet-500/30"
-          >
-            <Play size={10} fill="currentColor" />
-            {displayTime}
-          </button>
-        );
+      if (tagMatch && !foundFirst) {
+        foundFirst = true;
+        // Only parse the very first time string if multiple exist in the tag
+        const firstTimeStr = tagMatch[1].split(',')[0].trim();
+        const match = firstTimeStr.match(/(?:(\d+):)?(\d+):(\d+)/);
+
+        if (match) {
+          const h = match[1] ? parseInt(match[1]) : 0;
+          const m = parseInt(match[2]);
+          const s = parseInt(match[3]);
+          const totalSeconds = h * 3600 + m * 60 + s;
+          const displayTime = `${match[1] ? match[1] + ':' : ''}${match[2]}:${match[3]}`;
+
+          return (
+            <button
+              key={i}
+              onClick={() => jumpToTimestamp(totalSeconds)}
+              className="inline-flex items-center gap-1 mx-1 px-2 py-0.5 rounded-md bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-bold text-xs transition-colors border border-violet-500/30"
+            >
+              <Play size={10} fill="currentColor" />
+              {displayTime}
+            </button>
+          );
+        }
       }
+      // Return as plain text for subsequent tags or malformed matches
       return <span key={i}>{part}</span>;
     });
   }

@@ -12,16 +12,18 @@ import { SystemMessage, HumanMessage } from "@langchain/core/messages";
 let vectorStore = null;
 let currentVideoId = null;
 
+//NEVER touch model
+//model MUST be gemini-3-flash-preview
 const llm = new ChatGoogleGenerativeAI({
     model: "gemini-3-flash-preview",
-    apiKey: process.env.GOOGLE_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY2,
     temperature: 0,
 });
 
-//model should be gemini-embedding-2-preview
+//model MUST be gemini-embedding-2-preview
 const embeddings = new GoogleGenerativeAIEmbeddings({
     model: "gemini-embedding-2-preview",
-    apiKey: process.env.GOOGLE_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY2,
 });
 
 const checkpointer = new MemorySaver();
@@ -86,18 +88,21 @@ export async function chatWithVideo(videoId, prompt, threadId) {
             console.log("Vector Store Initialized.");
         }
 
-        // Check if documents for this videoId already exist in the vector store
+        // Check if documents for this videoId already exist and have the new precision format (v2)
         const existingDocs = await vectorStore.similaritySearch("the", 1, { video_id: videoId });
+        const isUpToDate = existingDocs.length > 0 &&
+            existingDocs[0].metadata.video_id === videoId &&
+            existingDocs[0].metadata.format_version === "v2";
 
-        if (!(existingDocs.length > 0 && existingDocs[0].metadata.video_id === videoId)) {
-            console.log(`\nIndexing transcript for video ${videoId} into Neon...`);
+        if (!isUpToDate) {
+            console.log(`\nIndexing/Refreshing transcript for video ${videoId} (Precision V2)...`);
             const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
             const chunks = await getTranscriptChunks(videoUrl);
 
             await vectorStore.addDocuments(chunks);
-            console.log(`Successfully indexed ${chunks.length} chunks.`);
+            console.log(`Successfully indexed ${chunks.length} precision chunks.`);
         } else {
-            console.log(`Knowledge found for video ${videoId}. Reusing existing index.`);
+            console.log(`Knowledge found for video ${videoId} (V2). Reusing existing index.`);
         }
 
         const config = { configurable: { thread_id: threadId } };
@@ -116,7 +121,14 @@ export async function chatWithVideo(videoId, prompt, threadId) {
                 - LATEST VIDEO ID: ${videoId}
                 - A searchable transcript is AVAILABLE via the 'search_video_transcript' tool.
                 - ALWAYS use the tool before answering questions about the video content.
-                - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.
+                - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.                
+                - TIMESTAMPS: The transcript chunks contain inline markers like [Timestamp: HH:MM:SS, HH:MM:SS, ...]. 
+                - CITATIONS: Use the nearest inline [MM:SS] marker to the information you are quoting.
+                - SUGGESTIONS: At the absolute end of your response (after the citation), provide exactly 3 suggested follow-up questions that explore the answer you just gave.
+                - FORMAT FOR SUGGESTIONS: You MUST append the following exactly at the end of your message:
+                  ---SUGGESTIONS---
+                  ["Question 1?", "Question 2?", "Question 3?"]
+                
                 - If the search tool returns no results, state that the transcript does not seem to contain specific info about the query.`
             }));
         }
@@ -129,9 +141,24 @@ export async function chatWithVideo(videoId, prompt, threadId) {
 
         const outputMessages = response.messages;
         const lastMessage = outputMessages[outputMessages.length - 1];
+        let content = lastMessage.content;
 
-        // Search for [Timestamp: HH:MM:SS] or [Timestamp: MM:SS]
-        const timestampMatch = lastMessage.content.match(/\[Timestamp:\s*(?:(\d+):)?(\d+):(\d+)\]/);
+        // Parse Suggestions from the SINGLE response
+        let suggestions = [];
+        const suggestionMarker = "---SUGGESTIONS---";
+        if (content.includes(suggestionMarker)) {
+            const parts = content.split(suggestionMarker);
+            content = parts[0].trim();
+            const rawSuggestions = parts[1].trim().replace(/```json|```/g, '').trim();
+            try {
+                suggestions = JSON.parse(rawSuggestions);
+            } catch (e) {
+                console.warn("Failed to parse consolidated suggestions:", e.message);
+            }
+        }
+
+        // Search for the first [Timestamp: ...] tag in the response
+        const timestampMatch = content.match(/\[Timestamp:\s*(?:(\d+):)?(\d+):(\d+)\]/i);
         let timestampSeconds = undefined;
         if (timestampMatch) {
             const h = timestampMatch[1] ? parseInt(timestampMatch[1]) : 0;
@@ -140,31 +167,8 @@ export async function chatWithVideo(videoId, prompt, threadId) {
             timestampSeconds = h * 3600 + m * 60 + s;
         }
 
-        // Generate 3 suggested follow-up questions
-        let suggestions = [];
-        try {
-            const suggestionPrompt = `Based on this YouTube video (ID: ${videoId}) and the following AI answer, generate exactly 3 short follow-up questions a user might want to ask next.
-            
-AI Answer: ${lastMessage.content}
-
-Rules:
-- Return ONLY a JSON array of 3 strings, nothing else.
-- Each question must be concise (max 12 words).
-- Questions should explore different angles of the video content.
-- Do NOT repeat the original question.
-
-Example format: ["Question one?", "Question two?", "Question three?"]`;
-
-            const suggestionResponse = await llm.invoke([new HumanMessage({ content: suggestionPrompt })]);
-            const raw = suggestionResponse.content.trim().replace(/```json|```/g, '').trim();
-            suggestions = JSON.parse(raw);
-            if (!Array.isArray(suggestions)) suggestions = [];
-        } catch (e) {
-            console.warn("Could not generate suggestions:", e.message);
-        }
-
         return {
-            answer: lastMessage.content,
+            answer: content,
             timestamp: timestampSeconds,
             suggestions,
             video_id: videoId,
