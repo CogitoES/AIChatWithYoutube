@@ -121,6 +121,7 @@ export async function chatWithVideo(videoId, prompt, threadId) {
                 - LATEST VIDEO ID: ${videoId}
                 - A searchable transcript is AVAILABLE via the 'search_video_transcript' tool.
                 - ALWAYS use the tool before answering questions about the video content.
+                - SUMMARIES: If asked for a summary, provide a high-level overview of approximately 100 words. Focus on the main topics and key takeaways.
                 - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.                
                 - TIMESTAMPS: The transcript chunks contain inline markers like [Timestamp: HH:MM:SS, HH:MM:SS, ...]. 
                 - CITATIONS: Use the nearest inline [MM:SS] marker to the information you are quoting.

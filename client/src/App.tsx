@@ -48,16 +48,23 @@ function App() {
       if (videoId) {
         const fullUrl = `https://www.youtube.com/watch?v=${videoId}`;
         console.log("Extracted Video ID:", videoId, "Full URL:", fullUrl);
-        setActiveUrl(fullUrl)
-        setActiveVideoId(videoId)
-        setThreadId(`thread_${Math.random().toString(36).substr(2, 9)}`)
-        setMessages([{ role: 'assistant', content: `Video loaded (ID: ${videoId}). How can I help you today?` }])
+        setActiveUrl(fullUrl);
+        setActiveVideoId(videoId);
+        
+        const newThreadId = `thread_${Math.random().toString(36).substr(2, 9)}`;
+        setThreadId(newThreadId);
+        setMessages([{ role: 'assistant', content: `Video loaded. Generating summary...` }]);
+        
+        // Trigger auto-summary
+        // We pass the new values directly because state updates are async
+        setTimeout(() => {
+          sendMessage("Provide a concise summary of this video in approximately 100 words. Focus on the main topics and key takeaways.", videoId, newThreadId, true);
+        }, 100);
       } else {
         console.warn("Could not extract Video ID. Falling back to raw URL:", videoUrl);
-        // Fallback for non-standard but valid URLs
-        setActiveUrl(videoUrl)
-        setActiveVideoId(videoUrl)
-        setMessages([{ role: 'assistant', content: `Loading custom URL. Note: AI features work best with standard YouTube IDs.` }])
+        setActiveUrl(videoUrl);
+        setActiveVideoId(videoUrl);
+        setMessages([{ role: 'assistant', content: `Loading custom URL. Note: AI features work best with standard YouTube IDs.` }]);
       }
 
       setVideoUrl('') // Clear input
@@ -66,16 +73,22 @@ function App() {
   }
 
 
-  const sendMessage = async (text: string) => {
-    if (!text.trim() || !activeVideoId || isLoading) return
+  const sendMessage = async (text: string, overrideVideoId?: string, overrideThreadId?: string, isHidden: boolean = false) => {
+    const vId = overrideVideoId || activeVideoId;
+    const tId = overrideThreadId || threadId;
 
-    const userMsg: Message = { role: 'user', content: text }
-    setMessages(prev => [...prev, userMsg])
+    if (!text.trim() || !vId || isLoading) return
+
+    if (!isHidden) {
+      const userMsg: Message = { role: 'user', content: text }
+      setMessages(prev => [...prev, userMsg])
+    }
+    
     setInput('')
     setIsLoading(true)
 
     try {
-      const data = await sendChatMessage(activeVideoId, text, threadId)
+      const data = await sendChatMessage(vId, text, tId)
       const assistantMsg: Message = {
         role: 'assistant',
         content: data.answer,
@@ -118,14 +131,12 @@ function App() {
   const renderMessageContent = (content: string) => {
     // Regex for [Timestamp: HH:MM:SS, MM:SS, ...]
     const parts = content.split(/(\[Timestamp:\s*[^\]]+\])/gi);
-    let foundFirst = false;
 
     return parts.map((part, i) => {
       const tagMatch = part.match(/\[Timestamp:\s*([^\]]+)\]/i);
 
-      if (tagMatch && !foundFirst) {
-        foundFirst = true;
-        // Only parse the very first time string if multiple exist in the tag
+      if (tagMatch) {
+        // Only parse the very first time string if multiple exist in the tag (e.g. [Timestamp: 0:10, 0:20])
         const firstTimeStr = tagMatch[1].split(',')[0].trim();
         const match = firstTimeStr.match(/(?:(\d+):)?(\d+):(\d+)/);
 
