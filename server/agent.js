@@ -7,15 +7,16 @@ import "dotenv/config";
 import { NeonPostgres } from "@langchain/community/vectorstores/neon";
 import { getTranscriptChunks } from "./youtube.js";
 import { SystemMessage, HumanMessage } from "@langchain/core/messages";
+import { fetchWikipediaSummary, checkRateLimit } from "./factcheck.js";
 
 // Global state for tool and vector store
 let vectorStore = null;
 let currentVideoId = null;
 
 //NEVER touch model
-//model MUST be gemini-3-flash-preview
+//model MUST be gemini-3.1-flash-lite
 const llm = new ChatGoogleGenerativeAI({
-    model: "gemini-3-flash-preview",
+    model: "gemini-3.1-flash-lite",
     apiKey: process.env.GOOGLE_API_KEY2,
     temperature: 0,
 });
@@ -70,10 +71,40 @@ const searchTranscriptTool = tool(
     }
 );
 
+/**
+ * Tool for searching Wikipedia for fact-checking.
+ */
+const searchWikipediaTool = tool(
+    async ({ query }, config) => {
+        const threadId = config.configurable?.thread_id || "default";
+
+        console.log(`[FactCheck] Agent requested fact-check for: "${query}" on thread: ${threadId}`);
+
+        if (!checkRateLimit(threadId)) {
+            console.log(`[FactCheck] Rate limit exceeded for thread: ${threadId}`);
+            return "Error: Fact-check rate limit reached (5 requests per minute). Please wait before trying again.";
+        }
+
+        const result = await fetchWikipediaSummary(query);
+        if (!result) {
+            return "No relevant Wikipedia summary found for this statement. Please try rephrasing or search for a more specific topic.";
+        }
+
+        return `🔍 **Fact-Check Result:**\n\n${result.answer}\n\n**Source:** ${result.sourceUrl}`;
+    },
+    {
+        name: "search_wikipedia",
+        description: "Search Wikipedia for facts and summaries. Use this ONLY when the user asks to 'Fact-check' a statement or context.",
+        schema: z.object({
+            query: z.string().describe("The specific claim or topic to fact-check."),
+        }),
+    }
+);
+
 // 2. Initialize the agent using createAgent from langchain/agents
 const agent = createAgent({
     model: llm,
-    tools: [searchTranscriptTool],
+    tools: [searchTranscriptTool, searchWikipediaTool],
     checkpointer,
 });
 
@@ -96,11 +127,32 @@ export async function chatWithVideo(videoId, prompt, threadId) {
 
         if (!isUpToDate) {
             console.log(`\nIndexing/Refreshing transcript for video ${videoId} (Precision V2)...`);
-            const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-            const chunks = await getTranscriptChunks(videoUrl);
 
-            await vectorStore.addDocuments(chunks);
-            console.log(`Successfully indexed ${chunks.length} precision chunks.`);
+            // Normalize videoUrl - ensure we don't double up if videoId is already a URL
+            let videoUrl = videoId.startsWith('http') ? videoId : `https://www.youtube.com/watch?v=${videoId}`;
+
+            const rawChunks = await getTranscriptChunks(videoUrl);
+
+            // CRITICAL FIX: Filter out empty or whitespace-only chunks to prevent "vector must have at least 1 dimension" error
+            const chunks = rawChunks.filter(c => c.pageContent && c.pageContent.trim().length > 0);
+
+            if (chunks.length === 0) {
+                console.warn(`[WARNING] No valid text content found in transcript for video ${videoId}. Skipping indexing.`);
+            } else {
+                if (chunks.length !== rawChunks.length) {
+                    console.log(`[INFO] Filtered out ${rawChunks.length - chunks.length} empty/invalid chunks.`);
+                }
+
+                console.log(`[DEBUG] Final chunks to index: ${chunks.length}`);
+
+                try {
+                    await vectorStore.addDocuments(chunks);
+                    console.log(`Successfully indexed ${chunks.length} precision chunks.`);
+                } catch (insertError) {
+                    console.error("Vector Store Insertion Failed:", insertError.message);
+                    throw insertError;
+                }
+            }
         } else {
             console.log(`Knowledge found for video ${videoId} (V2). Reusing existing index.`);
         }
@@ -122,6 +174,7 @@ export async function chatWithVideo(videoId, prompt, threadId) {
                 - A searchable transcript is AVAILABLE via the 'search_video_transcript' tool.
                 - ALWAYS use the tool before answering questions about the video content.
                 - SUMMARIES: If asked for a summary, provide a high-level overview of approximately 100 words. Focus on the main topics and key takeaways.
+                - FORMATTING: Use double newlines (\n\n) between every paragraph or list item to ensure they are rendered as individual interactive units.
                 - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.                
                 - TIMESTAMPS: The transcript chunks contain inline markers like [Timestamp: HH:MM:SS, HH:MM:SS, ...]. 
                 - CITATIONS: Use the nearest inline [MM:SS] marker to the information you are quoting.
@@ -129,6 +182,9 @@ export async function chatWithVideo(videoId, prompt, threadId) {
                 - FORMAT FOR SUGGESTIONS: You MUST append the following exactly at the end of your message:
                   ---SUGGESTIONS---
                   ["Question 1?", "Question 2?", "Question 3?"]
+                
+                - FACT-CHECKING: If the user input starts with 'Fact-check this:', you MUST use the 'search_wikipedia' tool to verify the claim. 
+                - Responses to fact-checks should start with '🔍 **Fact-Check Result:**' and be concise.
                 
                 - If the search tool returns no results, state that the transcript does not seem to contain specific info about the query.`
             }));

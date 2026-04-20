@@ -9,6 +9,11 @@ export const chatApi = axios.create({
   },
 });
 
+export const fetchVideoMetadata = async (videoId: string) => {
+  const response = await chatApi.get(`/video/${videoId}/metadata`);
+  return response.data;
+};
+
 export const sendChatMessage = async (videoId: string, prompt: string, threadId: string) => {
   const response = await chatApi.post('/chat', {
     video_id: videoId,

@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect } from 'react'
 import ReactPlayer from 'react-player'
-import { Send, Play, MessageSquare, Video, Loader2 } from 'lucide-react'
-import { sendChatMessage } from './lib/api'
+import { Send, Play, MessageSquare, Video, Loader2, Search, Info, List, ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { sendChatMessage, fetchVideoMetadata } from './lib/api'
 import './App.css'
 
 interface Message {
@@ -12,11 +12,30 @@ interface Message {
   id?: string
 }
 
+// Memoized player component to prevent inline props from triggering re-renders that reset player state (like volume)
+const MemoizedPlayer = React.memo(({ activeUrl, playerRef }: any) => {
+  return (
+    <ReactPlayer
+      ref={playerRef}
+      src={activeUrl}
+      width="100%"
+      height="100%"
+      controls={true}
+      config={{
+        youtube: {
+          playerVars: { autoplay: 1, controls: 1, modestbranding: 1, rel: 0 }
+        }
+      }}
+    />
+  );
+}, (prevProps, nextProps) => {
+  return prevProps.activeUrl === nextProps.activeUrl;
+});
+
 function App() {
   const [videoUrl, setVideoUrl] = useState('')
   const [activeUrl, setActiveUrl] = useState('')
   const [activeVideoId, setActiveVideoId] = useState('')
-  const [isPlaying, setIsPlaying] = useState(false)
   const [input, setInput] = useState('')
   const [threadId, setThreadId] = useState(() => `thread_${Math.random().toString(36).substr(2, 9)}`)
   const [isLoading, setIsLoading] = useState(false)
@@ -26,6 +45,9 @@ function App() {
   ])
   // playerRef MUST be passed as a direct JSX prop, not inside a spread object
   // React silently ignores ref when it appears in a spread: {...({ ref: x } as any)}
+  const [metadata, setMetadata] = useState<{title?: string, description?: string, chapters?: any[], thumbnail?: string} | null>(null)
+  const [activeTab, setActiveTab] = useState<'timeline' | 'description'>('timeline')
+  const [isDescExpanded, setIsDescExpanded] = useState(false)
   const playerRef = useRef<any>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
@@ -40,14 +62,15 @@ function App() {
   const handleLoadVideo = () => {
     if (videoUrl) {
       console.log("Attempting to load URL:", videoUrl);
-      // Improved extraction logic for various YouTube URL formats
-      const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=|shorts\/)([^#\&\?]*).*/;
+      
+      // Robust regex for various YouTube formats (standard, shortened, shorts, embed)
+      const regExp = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^"&?\/\s]{11})/;
       const match = videoUrl.match(regExp);
-      const videoId = (match && match[2].length === 11) ? match[2] : null;
+      const videoId = match ? match[1] : null;
 
       if (videoId) {
         const fullUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        console.log("Extracted Video ID:", videoId, "Full URL:", fullUrl);
+        console.log("Extracted Video ID:", videoId);
         setActiveUrl(fullUrl);
         setActiveVideoId(videoId);
         
@@ -55,20 +78,36 @@ function App() {
         setThreadId(newThreadId);
         setMessages([{ role: 'assistant', content: `Video loaded. Generating summary...` }]);
         
-        // Trigger auto-summary
-        // We pass the new values directly because state updates are async
+        // Trigger auto-summary and metadata fetch
         setTimeout(() => {
           sendMessage("Provide a concise summary of this video in approximately 100 words. Focus on the main topics and key takeaways.", videoId, newThreadId, true);
+          loadMetadata(videoId);
         }, 100);
       } else {
-        console.warn("Could not extract Video ID. Falling back to raw URL:", videoUrl);
+        // Fallback for non-standard URLs
+        console.warn("Could not extract 11-char Video ID. Using raw input.");
         setActiveUrl(videoUrl);
         setActiveVideoId(videoUrl);
-        setMessages([{ role: 'assistant', content: `Loading custom URL. Note: AI features work best with standard YouTube IDs.` }]);
+        setMessages([{ role: 'assistant', content: `Loading URL. AI features might be limited for non-standard YouTube links.` }]);
       }
 
-      setVideoUrl('') // Clear input
-      setIsPlaying(true) // Start playing
+      setVideoUrl('')
+    }
+  }
+
+  const loadMetadata = async (videoId: string) => {
+    console.log("[METADATA] Loading metadata for:", videoId);
+    try {
+      const data = await fetchVideoMetadata(videoId);
+      console.log("[METADATA] Received data:", data);
+      setMetadata(data);
+      if (data.chapters && data.chapters.length > 0) {
+        setActiveTab('timeline');
+      } else {
+        setActiveTab('description');
+      }
+    } catch (err: any) {
+      console.error("[METADATA] Failed to load metadata:", err.message, err.response?.data);
     }
   }
 
@@ -111,17 +150,20 @@ function App() {
 
   const jumpToTimestamp = (seconds: number) => {
     const player = playerRef.current;
-    console.log("JUMP REQUESTED:", seconds, "playerRef.current:", player);
-    if (!player) {
-      console.error("No player ref. Make sure ref={playerRef} is a direct JSX prop.");
-      return;
-    }
-    // react-player v3: the ref exposes an HTMLMediaElement-compatible interface
-    // For YouTube, currentTime is a setter that calls the YouTube player's seekTo internally
+    if (!player) return;
+
     try {
-      player.currentTime = seconds;
-      if (player.paused) {
-        player.play?.().catch((e: any) => console.warn("play() failed:", e));
+      if (typeof player.seekTo === 'function') {
+        player.seekTo(seconds, 'seconds');
+        const internalPlayer = player.getInternalPlayer();
+        if (internalPlayer && typeof internalPlayer.playVideo === 'function') {
+          internalPlayer.playVideo();
+        }
+      } else {
+        player.currentTime = seconds;
+        if (player.paused) {
+          player.play?.().catch((e: any) => console.warn("play() failed:", e));
+        }
       }
     } catch (err) {
       console.error("Seek failed:", err);
@@ -129,40 +171,74 @@ function App() {
   }
 
   const renderMessageContent = (content: string) => {
-    // Regex for [Timestamp: HH:MM:SS, MM:SS, ...]
-    const parts = content.split(/(\[Timestamp:\s*[^\]]+\])/gi);
+    // 1. First split by bold markers **text**
+    const boldParts = content.split(/(\*\*[^*]+\*\*)/g);
 
-    return parts.map((part, i) => {
-      const tagMatch = part.match(/\[Timestamp:\s*([^\]]+)\]/i);
-
-      if (tagMatch) {
-        // Only parse the very first time string if multiple exist in the tag (e.g. [Timestamp: 0:10, 0:20])
-        const firstTimeStr = tagMatch[1].split(',')[0].trim();
-        const match = firstTimeStr.match(/(?:(\d+):)?(\d+):(\d+)/);
-
-        if (match) {
-          const h = match[1] ? parseInt(match[1]) : 0;
-          const m = parseInt(match[2]);
-          const s = parseInt(match[3]);
-          const totalSeconds = h * 3600 + m * 60 + s;
-          const displayTime = `${match[1] ? match[1] + ':' : ''}${match[2]}:${match[3]}`;
-
-          return (
-            <button
-              key={i}
-              onClick={() => jumpToTimestamp(totalSeconds)}
-              className="inline-flex items-center gap-1 mx-1 px-2 py-0.5 rounded-md bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-bold text-xs transition-colors border border-violet-500/30"
-            >
-              <Play size={10} fill="currentColor" />
-              {displayTime}
-            </button>
-          );
-        }
+    return boldParts.map((boldPart, bi) => {
+      // If it's a bold segment
+      if (boldPart.startsWith('**') && boldPart.endsWith('**')) {
+        return <strong key={`b-${bi}`} className="text-violet-300">{boldPart.slice(2, -2)}</strong>;
       }
-      // Return as plain text for subsequent tags or malformed matches
-      return <span key={i}>{part}</span>;
+
+      // 2. Then process timestamps in the non-bold segments
+      const parts = boldPart.split(/(\[Timestamp:\s*[^\]]+\])/gi);
+
+      return parts.map((part, i) => {
+        const tagMatch = part.match(/\[Timestamp:\s*([^\]]+)\]/i);
+
+        if (tagMatch) {
+          const firstTimeStr = tagMatch[1].split(',')[0].trim();
+          const match = firstTimeStr.match(/(?:(\d+):)?(\d+):(\d+)/);
+
+          if (match) {
+            const h = match[1] ? parseInt(match[1]) : 0;
+            const m = parseInt(match[2]);
+            const s = parseInt(match[3]);
+            const totalSeconds = h * 3600 + m * 60 + s;
+            const displayTime = `${match[1] ? match[1] + ':' : ''}${match[2]}:${match[3]}`;
+
+            return (
+              <button
+                key={`${bi}-${i}`}
+                onClick={() => jumpToTimestamp(totalSeconds)}
+                className="inline-flex items-center gap-1 mx-1 px-2 py-0.5 rounded-md bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-bold text-xs transition-colors border border-violet-500/30"
+              >
+                <Play size={10} fill="currentColor" />
+                {displayTime}
+              </button>
+            );
+          }
+        }
+        return <span key={`${bi}-${i}`}>{part}</span>;
+      });
     });
   }
+
+// New helper to render interactive paragraphs for chat or description
+function renderInteractiveParagraphs(content: string, isDescription: boolean = false) {
+  // Normalize bullet points to ensure they have a newline before them if they follow content
+  const normalized = content.replace(/([^\n])\n([*•-])/g, '$1\n\n$2');
+  const paragraphs = normalized.split(/\n\n/).filter(p => p.trim().length > 0);
+  
+  return paragraphs.map((para, i) => {
+    // Clean search text for AI prompt
+    const cleanSearchText = para.replace(/^[\s*•-]+/, '').trim();
+    
+    return (
+      <div
+        key={i}
+        title={isDescription ? "Click to ask AI about this point" : "Click to fact-check this claim"}
+        className={`cursor-pointer hover:bg-white/10 rounded-lg p-2 transition-all flex items-start group/para relative mb-2 ${isDescription ? 'hover:bg-violet-500/5' : ''}`}
+        onClick={() => sendMessage(isDescription ? `Tell me more about this: ${cleanSearchText}` : `Fact-check this: ${cleanSearchText}`, undefined, undefined, true)}
+      >
+        <Search size={14} className={`mr-2 mt-1 flex-shrink-0 text-violet-400 transition-opacity ${isDescription ? 'opacity-20 group-hover/para:opacity-100' : 'opacity-40 group-hover/para:opacity-100'}`} />
+        <div className="flex-1">
+          {renderMessageContent(para.trim())}
+        </div>
+      </div>
+    );
+  });
+}
 
   return (
     <div className="flex h-screen w-screen text-slate-100 font-sans overflow-hidden" style={{ background: '#0d0a1e' }}>
@@ -192,34 +268,14 @@ function App() {
           </div>
         </header>
 
-        <main className="flex-1 flex items-center justify-center p-8 relative" style={{ background: 'rgba(13,10,30,0.3)' }}>
-          <div className="w-full max-w-5xl aspect-video rounded-2xl overflow-hidden shadow-2xl border border-purple-900/40 relative z-0" style={{ background: 'rgba(20,10,40,0.8)' }}>
+        <main className="flex-1 overflow-y-auto p-6 space-y-8" style={{ background: 'rgba(13,10,30,0.3)' }}>
+          {/* Video Player Display */}
+          <div className="w-full max-w-5xl mx-auto aspect-video rounded-2xl overflow-hidden shadow-2xl border border-purple-900/40 relative z-0" style={{ background: 'rgba(20,10,40,0.8)' }}>
             {isMounted && activeUrl ? (
               <div className="w-full h-full relative z-10 pointer-events-auto">
-                {/* ref MUST be a direct prop — it is silently dropped when spread */}
-                <ReactPlayer
-                  ref={playerRef as any}
-                  {...({
-                    src: activeUrl,
-                    width: "100%",
-                    height: "100%",
-                    controls: true,
-                    playing: isPlaying,
-                    onPlay: () => setIsPlaying(true),
-                    onPause: () => setIsPlaying(false),
-                    onReady: () => console.log("ReactPlayer ready. ref set:", !!playerRef.current),
-                    onError: (e: any) => console.error("ReactPlayer Error:", e),
-                    config: {
-                      youtube: {
-                        playerVars: {
-                          autoplay: 1,
-                          controls: 1,
-                          modestbranding: 1,
-                          rel: 0,
-                        }
-                      }
-                    }
-                  } as any)}
+                <MemoizedPlayer
+                  playerRef={playerRef}
+                  activeUrl={activeUrl}
                 />
               </div>
             ) : (
@@ -234,6 +290,88 @@ function App() {
               </div>
             )}
           </div>
+
+          {/* Video Information & Timeline Section */}
+          {metadata && (
+            <div className="w-full max-w-5xl mx-auto rounded-2xl border border-purple-900/30 overflow-hidden backdrop-blur-md" style={{ background: 'rgba(20,10,50,0.4)' }}>
+              <div className="flex border-b border-purple-900/30 px-4 bg-purple-950/20">
+                <button
+                  onClick={() => setActiveTab('timeline')}
+                  className={`flex items-center gap-2 px-6 py-3 text-xs font-bold uppercase tracking-widest transition-all border-b-2 ${activeTab === 'timeline' ? 'border-violet-500 text-violet-400' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
+                >
+                  <List size={14} /> Timeline
+                </button>
+                <button
+                  onClick={() => setActiveTab('description')}
+                  className={`flex items-center gap-2 px-6 py-3 text-xs font-bold uppercase tracking-widest transition-all border-b-2 ${activeTab === 'description' ? 'border-violet-500 text-violet-400' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
+                >
+                  <Info size={14} /> Description
+                </button>
+              </div>
+
+              <div className="p-6">
+                {activeTab === 'timeline' ? (
+                  <div className="space-y-3">
+                    {metadata.chapters && metadata.chapters.length > 0 ? (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {metadata.chapters.map((chapter, idx) => (
+                          <div key={idx} className="flex items-center gap-2 group">
+                            <button
+                              onClick={() => jumpToTimestamp(chapter.seconds)}
+                              className="flex-1 flex items-center gap-3 p-3 rounded-xl bg-white/5 hover:bg-violet-600/20 border border-white/5 hover:border-violet-500/30 transition-all text-left"
+                            >
+                              <span className="flex-shrink-0 w-12 text-[10px] font-black text-violet-400 bg-violet-400/10 py-1 rounded text-center group-hover:bg-violet-500 group-hover:text-white transition-colors">
+                                {chapter.time}
+                              </span>
+                              <span className="text-sm font-medium text-slate-300 group-hover:text-white truncate">
+                                {chapter.title}
+                              </span>
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                sendMessage(`Explain the context and key points of the video section titled "${chapter.title}" starting at ${chapter.time}.`);
+                              }}
+                              title="Ask AI about this section"
+                              className="p-3 rounded-xl bg-white/5 hover:bg-violet-600/20 border border-white/5 hover:border-violet-500/30 transition-all text-violet-400 opacity-0 group-hover:opacity-100"
+                            >
+                              <MessageSquare size={16} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-8 text-slate-500">
+                        <Clock size={32} className="mx-auto mb-2 opacity-20" />
+                        <p className="text-sm">No chapters found in this video's description.</p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="relative">
+                    <div 
+                      className={`text-sm leading-relaxed text-slate-400 transition-all duration-500 custom-scrollbar ${isDescExpanded ? 'max-h-96 overflow-y-auto pr-2' : 'max-h-48 overflow-hidden'}`}
+                      style={{ whiteSpace: 'pre-wrap' }}
+                    >
+                      {renderInteractiveParagraphs(metadata.description || '', true)}
+                    </div>
+                    {!isDescExpanded && metadata.description && metadata.description.length > 300 && (
+                      <div className="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-[#140a32] to-transparent pointer-events-none" />
+                    )}
+                    {metadata.description && metadata.description.length > 300 && (
+                      <button
+                        onClick={() => setIsDescExpanded(!isDescExpanded)}
+                        className="mt-4 flex items-center gap-1.5 text-xs font-bold text-violet-400 hover:text-violet-300 transition-colors uppercase tracking-wider"
+                      >
+                        {isDescExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                        {isDescExpanded ? 'Show Less' : 'Show Full Description'}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </main>
       </div>
 
@@ -249,16 +387,24 @@ function App() {
         </header>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-none">
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[90%] rounded-2xl p-4 shadow-xl border ${msg.role === 'user'
-                ? 'bg-violet-600 text-white rounded-tr-none border-violet-500'
-                : 'text-slate-100 rounded-tl-none border-purple-800/40'
-                }`}
-                style={msg.role === 'assistant' ? { background: 'rgba(50,25,90,0.6)' } : {}}
-              >
+          {messages.map((msg, i) => {
+            const isFactCheck = msg.role === 'assistant' && msg.content.includes('Fact-Check Result:');
+            
+            return (
+              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[90%] rounded-2xl p-4 shadow-xl border ${msg.role === 'user'
+                  ? 'bg-violet-600 text-white rounded-tr-none border-violet-500'
+                  : isFactCheck 
+                    ? 'border-emerald-500/40 rounded-tl-none' 
+                    : 'text-slate-100 rounded-tl-none border-purple-800/40'
+                  }`}
+                  style={msg.role === 'assistant' ? { 
+                    background: isFactCheck ? 'rgba(6, 78, 59, 0.3)' : 'rgba(50,25,90,0.6)',
+                    backdropFilter: 'blur(10px)'
+                  } : {}}
+                >
                 <div className="text-[14px] leading-relaxed whitespace-pre-wrap">
-                  {msg.role === 'assistant' ? renderMessageContent(msg.content) : msg.content}
+                  {msg.role === 'assistant' ? renderInteractiveParagraphs(msg.content) : msg.content}
                 </div>
                 {msg.role === 'assistant' && msg.suggestions && msg.suggestions.length > 0 && (
                   <div className="mt-3 pt-3 border-t border-purple-800/30 flex flex-col gap-1.5">
@@ -273,9 +419,10 @@ function App() {
                     ))}
                   </div>
                 )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {isLoading && (
             <div className="flex justify-start">
               <div className="rounded-2xl rounded-tl-none p-4 flex items-center gap-3 border border-purple-800/30" style={{ background: 'rgba(50,25,90,0.4)' }}>

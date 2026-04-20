@@ -2,12 +2,34 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { chatWithVideo } from "./agent.js";
+import { getVideoDetails } from "./youtube.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+/**
+ * GET /video/:videoId/metadata
+ */
+app.get("/video/:videoId/metadata", async (req, res) => {
+    const { videoId } = req.params;
+    console.log(`[METADATA] Fetching metadata for ${videoId}`);
+    
+    try {
+        const data = await getVideoDetails(videoId);
+        res.json({
+            title: data.snippet.title,
+            description: data.snippet.description,
+            chapters: data.chapters || [],
+            thumbnail: data.snippet.thumbnails?.high?.url || data.snippet.thumbnails?.default?.url
+        });
+    } catch (error) {
+        console.error("Metadata Error:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 /**
  * POST /chat

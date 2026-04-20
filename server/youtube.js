@@ -101,6 +101,9 @@ export async function getVideoDetails(urlOrId) {
             }
         }
 
+        // 3. Extract Chapters
+        video.chapters = extractChapters(video.snippet.description);
+
         return video;
     } catch (error) {
         console.error('Error fetching YouTube data:', error.message);
@@ -120,6 +123,52 @@ export function formatTime(seconds) {
         m.toString().padStart(2, '0'),
         s.toString().padStart(2, '0')
     ].filter(Boolean).join(':');
+}
+
+/**
+ * Parses HH:MM:SS or MM:SS into total seconds.
+ * @param {string} timeStr
+ * @returns {number}
+ */
+export function parseTimeToSeconds(timeStr) {
+    const parts = timeStr.split(':').map(Number);
+    if (parts.length === 3) {
+        return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    } else if (parts.length === 2) {
+        return parts[0] * 60 + parts[1];
+    }
+    return 0;
+}
+
+/**
+ * Extracts chapters from the video description.
+ * @param {string} description
+ * @returns {Array} - List of objects { time, seconds, title }
+ */
+export function extractChapters(description) {
+    if (!description) return [];
+
+    const chapters = [];
+    const lines = description.split('\n');
+    
+    // Improved regex to handle common chapter formats
+    // e.g., 00:00 - Intro, [05:23] Topic, 1:23:45 Conclusion
+    const timeRegex = /(?:\s|^|\(|\[)(\d{1,2}:(?:\d{2}:)?\d{2})(?:\)|\])?(?:\s*[-–—]\s*|\s+)(.+)/;
+
+    for (const line of lines) {
+        const match = line.match(timeRegex);
+        if (match) {
+            const timeStr = match[1];
+            const title = match[2].trim();
+            const seconds = parseTimeToSeconds(timeStr);
+            
+            // Only add if we haven't seen this timestamp yet
+            if (!chapters.find(c => c.seconds === seconds)) {
+                chapters.push({ time: timeStr, seconds, title });
+            }
+        }
+    }
+    return chapters;
 }
 /**
  * Loads video data and splits transcription into timestamped chunks.
