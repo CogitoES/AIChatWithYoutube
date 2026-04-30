@@ -3,10 +3,14 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import logger from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, 'data');
+
+// Transcript cache TTL: 7 days
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const youtube = google.youtube('v3');
 const API_KEY = process.env.YOUTUBE_API_KEY;
@@ -21,7 +25,8 @@ export function saveVideoData(videoId, data) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     const filePath = path.join(DATA_DIR, `${videoId}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    // Stamp the time so we can expire the cache later
+    fs.writeFileSync(filePath, JSON.stringify({ ...data, cached_at: Date.now() }, null, 2));
     console.log(`Data saved to ${filePath}`);
 }
 
@@ -33,9 +38,15 @@ export function saveVideoData(videoId, data) {
 export function loadVideoData(videoId) {
     const filePath = path.join(DATA_DIR, `${videoId}.json`);
     if (fs.existsSync(filePath)) {
-        console.log(`Loading data from ${filePath}`);
         const rawData = fs.readFileSync(filePath, 'utf8');
-        return JSON.parse(rawData);
+        const data = JSON.parse(rawData);
+        // Expire cache entries older than CACHE_TTL_MS
+        if (!data.cached_at || (Date.now() - data.cached_at) > CACHE_TTL_MS) {
+            console.log(`Cache expired for ${videoId}. Will re-fetch.`);
+            return null;
+        }
+        console.log(`Loading data from ${filePath}`);
+        return data;
     }
     return null;
 }
@@ -52,6 +63,47 @@ export function extractVideoId(url) {
 }
 
 import { YoutubeTranscript } from 'youtube-transcript-plus';
+
+/**
+ * Fetches only video metadata (snippet and chapters) from YouTube.
+ * Skips transcription for speed.
+ * @param {string} urlOrId
+ * @returns {Promise<object>}
+ */
+export async function getVideoMetadataOnly(urlOrId) {
+    const videoId = extractVideoId(urlOrId);
+    if (!videoId) throw new Error('Invalid YouTube URL or Video ID');
+
+    // 1. Try to load from local storage
+    const cachedData = loadVideoData(videoId);
+    if (cachedData) {
+        console.log(`[Metadata] Serving from file cache for ${videoId}`);
+        cachedData.chapters = cachedData.chapters || extractChapters(cachedData.snippet?.description);
+        return cachedData;
+    }
+
+    if (!API_KEY || API_KEY === 'YOUR_YOUTUBE_API_KEY_HERE') {
+        throw new Error('YouTube API Key is missing. Please set YOUTUBE_API_KEY in your .env file.');
+    }
+
+    console.log(`[Metadata] Fetching from YouTube API for ${videoId}...`);
+    console.time(`[Perf] YouTube API: list videos (metadata)`);
+    const response = await youtube.videos.list({
+        key: API_KEY,
+        id: videoId,
+        part: 'snippet,contentDetails,statistics,status',
+    });
+    console.timeEnd(`[Perf] YouTube API: list videos (metadata)`);
+
+    const video = response.data.items[0];
+    if (!video) throw new Error('Video not found');
+
+    video.chapters = extractChapters(video.snippet.description);
+    // Save metadata-only cache
+    saveVideoData(videoId, video);
+
+    return video;
+}
 
 /**
  * Fetches video metadata and transcription from YouTube.
@@ -83,23 +135,24 @@ export async function getVideoDetails(urlOrId) {
             throw new Error('Video not found');
         }
 
-        // 2. Fetch Transcription
-        console.log(`Fetching transcript for ${videoId}...`);
+    logger.log(`Fetching transcript for ${videoId}...`);
+    logger.time(`YoutubeTranscript.fetchTranscript (${videoId})`);
+    try {
+        const transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+        video.transcription = transcript;
+    } catch (transcriptError) {
+        logger.warn(`Could not fetch English transcript for ${videoId}: ${transcriptError.message}`);
+        logger.log("Attempting to fetch any available transcript...");
         try {
-            const transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
-            video.transcription = transcript;
-        } catch (transcriptError) {
-            console.warn(`Warning: Could not fetch English transcript for ${videoId}: ${transcriptError.message}`);
-            console.log("Attempting to fetch any available transcript...");
-            try {
-                const anyTranscript = await YoutubeTranscript.fetchTranscript(videoId);
-                video.transcription = anyTranscript;
-                console.log("Fetched non-English or default transcript.");
-            } catch (anyError) {
-                console.error(`Final transcript fetch failed: ${anyError.message}`);
-                video.transcription = null;
-            }
+            const anyTranscript = await YoutubeTranscript.fetchTranscript(videoId);
+            video.transcription = anyTranscript;
+            logger.log("Fetched non-English or default transcript.");
+        } catch (anyError) {
+            logger.error(`Final transcript fetch failed: ${anyError.message}`);
+            video.transcription = null;
         }
+    }
+    logger.timeEnd(`YoutubeTranscript.fetchTranscript (${videoId})`);
 
         // 3. Extract Chapters
         video.chapters = extractChapters(video.snippet.description);
@@ -150,7 +203,7 @@ export function extractChapters(description) {
 
     const chapters = [];
     const lines = description.split('\n');
-    
+
     // Improved regex to handle common chapter formats
     // e.g., 00:00 - Intro, [05:23] Topic, 1:23:45 Conclusion
     const timeRegex = /(?:\s|^|\(|\[)(\d{1,2}:(?:\d{2}:)?\d{2})(?:\)|\])?(?:\s*[-–—]\s*|\s+)(.+)/;
@@ -161,7 +214,7 @@ export function extractChapters(description) {
             const timeStr = match[1];
             const title = match[2].trim();
             const seconds = parseTimeToSeconds(timeStr);
-            
+
             // Only add if we haven't seen this timestamp yet
             if (!chapters.find(c => c.seconds === seconds)) {
                 chapters.push({ time: timeStr, seconds, title });
@@ -178,7 +231,7 @@ export function extractChapters(description) {
  * @param {number} overlapLines - Number of snippets to overlap between chunks.
  * @returns {Promise<Array>} - Array of chunk objects with text and offset.
  */
-export async function getTranscriptChunks(urlOrId, targetLength = 500, overlapLines = 2) {
+export async function getTranscriptChunks(urlOrId, targetLength = 1500, overlapLines = 1) {
     const videoId = extractVideoId(urlOrId);
     if (!videoId) throw new Error("Invalid YouTube ID or URL");
 

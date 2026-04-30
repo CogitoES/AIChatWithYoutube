@@ -8,15 +8,21 @@ import { NeonPostgres } from "@langchain/community/vectorstores/neon";
 import { getTranscriptChunks } from "./youtube.js";
 import { SystemMessage, HumanMessage } from "@langchain/core/messages";
 import { fetchWikipediaSummary, checkRateLimit } from "./factcheck.js";
+import logger from "./logger.js";
 
-// Global state for tool and vector store
+// Shared vector store instance (safe — read-only after init)
 let vectorStore = null;
-let currentVideoId = null;
+
+// Per-thread video ID registry — avoids race conditions between concurrent requests
+const videoIdByThread = new Map();
+
+// Track ongoing indexing tasks to prevent duplicate work
+const indexingTasks = new Map();
 
 //NEVER touch model
-//model MUST be gemini-3.1-flash-lite
+//model MUST be gemini-3.1-flash-lite-preview
 const llm = new ChatGoogleGenerativeAI({
-    model: "gemini-3.1-flash-lite",
+    model: "gemini-3.1-flash-lite-preview",
     apiKey: process.env.GOOGLE_API_KEY2,
     temperature: 0,
 });
@@ -39,15 +45,23 @@ const dbConfig = {
  * Tool for searching the video transcript.
  */
 const searchTranscriptTool = tool(
-    async ({ query }) => {
+    async ({ query }, config) => {
         if (!vectorStore) {
             return "Error: No video transcript loaded. Please provide a YouTube URL first.";
         }
 
-        console.log(`Searching transcript for: "${query}" (Video: ${currentVideoId})...`);
+        // Look up the video ID for this specific thread — thread-safe
+        const threadId = config.configurable?.thread_id;
+        const videoId = videoIdByThread.get(threadId);
+
+        if (!videoId) {
+            return "Error: No video context found for this session. Please reload the video.";
+        }
+
+        console.log(`Searching transcript for: "${query}" (Video: ${videoId}, Thread: ${threadId})...`);
         try {
-            // CRITICAL: Filter results by video_id to ensure context accuracy
-            const results = await vectorStore.similaritySearch(query, 5, { video_id: currentVideoId });
+            // Filter results by video_id to ensure context accuracy
+            const results = await vectorStore.similaritySearch(query, 5, { video_id: videoId });
             console.log(`Search complete. Found ${results.length} results.`);
 
             if (results.length === 0) {
@@ -101,78 +115,102 @@ const searchWikipediaTool = tool(
     }
 );
 
-// 2. Initialize the agent using createAgent from langchain/agents
+// 2. Initialize the agent (Keeping tools limited as requested)
 const agent = createAgent({
     model: llm,
-    tools: [searchTranscriptTool, searchWikipediaTool],
+    tools: [searchWikipediaTool],
     checkpointer,
 });
 
+/**
+ * Ensures the video transcript is indexed in the vector store.
+ * Handles deduplication if multiple requests for the same video arrive.
+ * @param {string} videoId
+ */
+export async function ensureVideoIndexed(videoId) {
+    // If already indexing this video, wait for the existing task
+    if (indexingTasks.has(videoId)) {
+        logger.log(`[Indexing] Already indexing ${videoId}, waiting...`);
+        return indexingTasks.get(videoId);
+    }
+
+    const task = (async () => {
+        try {
+            logger.time(`ensureVideoIndexed: ${videoId}`);
+
+            if (!vectorStore || vectorStore.tableName !== "video_embeddings") {
+                logger.time(`Init Vector Store`);
+                vectorStore = await NeonPostgres.initialize(embeddings, dbConfig);
+                logger.timeEnd(`Init Vector Store`);
+            }
+
+            logger.time(`Neon Probe Check (similaritySearch)`);
+            const existingDocs = await vectorStore.similaritySearch("the", 1, { video_id: videoId });
+            logger.timeEnd(`Neon Probe Check (similaritySearch)`);
+
+            const isUpToDate = existingDocs.length > 0 &&
+                existingDocs[0].metadata.video_id === videoId &&
+                existingDocs[0].metadata.format_version === "v2";
+
+            if (!isUpToDate) {
+                logger.log(`\nIndexing/Refreshing transcript for video ${videoId} (Precision V2)...`);
+
+                let videoUrl = videoId.startsWith('http') ? videoId : `https://www.youtube.com/watch?v=${videoId}`;
+
+                logger.time(`Get Transcript Chunks`);
+                const rawChunks = await getTranscriptChunks(videoUrl);
+                logger.timeEnd(`Get Transcript Chunks`);
+
+                const chunks = rawChunks.filter(c => c.pageContent && c.pageContent.trim().length > 0);
+
+                if (chunks.length === 0) {
+                    logger.warn(`[WARNING] No valid text content found for video ${videoId}.`);
+                } else {
+                    logger.log(`[DEBUG] Final chunks to index: ${chunks.length}`);
+                    logger.time(`Neon addDocuments (${chunks.length} chunks)`);
+                    await vectorStore.addDocuments(chunks);
+                    logger.timeEnd(`Neon addDocuments (${chunks.length} chunks)`);
+                    logger.log(`Successfully indexed ${chunks.length} precision chunks.`);
+                }
+            } else {
+                logger.log(`Knowledge found for video ${videoId} (V2). Reusing existing index.`);
+            }
+        } catch (error) {
+            logger.error(`[Indexing Error] ${videoId}:`, error.message);
+            throw error;
+        } finally {
+            logger.timeEnd(`ensureVideoIndexed: ${videoId}`);
+            indexingTasks.delete(videoId);
+        }
+    })();
+
+    indexingTasks.set(videoId, task);
+    return task;
+}
+
 export async function chatWithVideo(videoId, prompt, threadId) {
     try {
-        console.log(`\n--- Chatting with Video ID: ${videoId} ---`);
-        currentVideoId = videoId; // Set current video context for tools
+        logger.log(`\n--- Chatting with Video ID: ${videoId}, Thread: ${threadId} ---`);
+        // Register videoId for this specific thread
+        videoIdByThread.set(threadId, videoId);
 
-        if (!vectorStore || vectorStore.tableName !== "video_embeddings") {
-            console.log("Initializing Vector Store...");
-            vectorStore = await NeonPostgres.initialize(embeddings, dbConfig);
-            console.log("Vector Store Initialized.");
-        }
-
-        // Check if documents for this videoId already exist and have the new precision format (v2)
-        const existingDocs = await vectorStore.similaritySearch("the", 1, { video_id: videoId });
-        const isUpToDate = existingDocs.length > 0 &&
-            existingDocs[0].metadata.video_id === videoId &&
-            existingDocs[0].metadata.format_version === "v2";
-
-        if (!isUpToDate) {
-            console.log(`\nIndexing/Refreshing transcript for video ${videoId} (Precision V2)...`);
-
-            // Normalize videoUrl - ensure we don't double up if videoId is already a URL
-            let videoUrl = videoId.startsWith('http') ? videoId : `https://www.youtube.com/watch?v=${videoId}`;
-
-            const rawChunks = await getTranscriptChunks(videoUrl);
-
-            // CRITICAL FIX: Filter out empty or whitespace-only chunks to prevent "vector must have at least 1 dimension" error
-            const chunks = rawChunks.filter(c => c.pageContent && c.pageContent.trim().length > 0);
-
-            if (chunks.length === 0) {
-                console.warn(`[WARNING] No valid text content found in transcript for video ${videoId}. Skipping indexing.`);
-            } else {
-                if (chunks.length !== rawChunks.length) {
-                    console.log(`[INFO] Filtered out ${rawChunks.length - chunks.length} empty/invalid chunks.`);
-                }
-
-                console.log(`[DEBUG] Final chunks to index: ${chunks.length}`);
-
-                try {
-                    await vectorStore.addDocuments(chunks);
-                    console.log(`Successfully indexed ${chunks.length} precision chunks.`);
-                } catch (insertError) {
-                    console.error("Vector Store Insertion Failed:", insertError.message);
-                    throw insertError;
-                }
-            }
-        } else {
-            console.log(`Knowledge found for video ${videoId} (V2). Reusing existing index.`);
-        }
+        // Ensure video is indexed (waits if background task is still running)
+        await ensureVideoIndexed(videoId);
 
         const config = { configurable: { thread_id: threadId } };
         const state = await agent.getState(config);
         const history = state.values?.messages || [];
         const hasHistory = history.length > 0;
 
-        console.log(`\nThread ID: ${threadId}`);
-        console.log(`Existing history length: ${history.length}`);
+        logger.log(`\nThread ID: ${threadId}`);
+        logger.log(`Existing history length: ${history.length}`);
 
         const inputMessages = [];
         if (!hasHistory) {
-            console.log("No history found. Adding system instruction for new thread.");
+            logger.log("No history found. Adding system instruction for new thread.");
             inputMessages.push(new SystemMessage({
                 content: `You are a specialized AI analyzer for YouTube videos. 
                 - LATEST VIDEO ID: ${videoId}
-                - A searchable transcript is AVAILABLE via the 'search_video_transcript' tool.
-                - ALWAYS use the tool before answering questions about the video content.
                 - SUMMARIES: If asked for a summary, provide a high-level overview of approximately 100 words. Focus on the main topics and key takeaways.
                 - FORMATTING: Use double newlines (\n\n) between every paragraph or list item to ensure they are rendered as individual interactive units.
                 - CITATIONS: Always include timestamps using [Timestamp: HH:MM:SS] or [Timestamp: M:SS] in your answers.                
@@ -190,11 +228,23 @@ export async function chatWithVideo(videoId, prompt, threadId) {
             }));
         }
 
-        inputMessages.push(new HumanMessage({ content: prompt }));
+        // --- DIRECT RAG INJECTION (Code Only) ---
+        logger.time(`Direct RAG Search (${videoId})`);
+        const searchResults = await vectorStore.similaritySearch(prompt, 10, { video_id: videoId });
+        logger.timeEnd(`Direct RAG Search (${videoId})`);
 
-        console.log("Invoking agent...");
+        const contextText = searchResults.map(res =>
+            `[Timestamp: ${res.metadata.timestamp}] ${res.pageContent}`
+        ).join("\n---\n");
+
+        const userContent = `--- TRANSCRIPT CONTEXT ---\n${contextText}\n\n--- USER QUESTION ---\n${prompt}`;
+        inputMessages.push(new HumanMessage({ content: userContent }));
+
+        logger.log("Invoking agent...");
+        logger.time(`agent.invoke (${videoId})`);
         const response = await agent.invoke({ messages: inputMessages }, config);
-        console.log("Agent response received.");
+        logger.timeEnd(`agent.invoke (${videoId})`);
+        logger.log("Agent response received.");
 
         const outputMessages = response.messages;
         const lastMessage = outputMessages[outputMessages.length - 1];
