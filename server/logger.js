@@ -12,24 +12,27 @@ fs.writeFileSync(LOG_FILE, `--- LOG STARTED AT ${new Date().toISOString()} ---\n
 /**
  * Logs a message with a precise timestamp to both console and debug.log.
  */
-export function log(message) {
+export function log(...args) {
     const timestamp = new Date().toISOString();
+    const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
     const formatted = `[${timestamp}] INFO: ${message}`;
-    console.log(message);
+    console.log(...args);
     fs.appendFileSync(LOG_FILE, formatted + '\n');
 }
 
-export function warn(message) {
+export function warn(...args) {
     const timestamp = new Date().toISOString();
+    const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
     const formatted = `[${timestamp}] WARN: ${message}`;
-    console.warn(message);
+    console.warn(...args);
     fs.appendFileSync(LOG_FILE, formatted + '\n');
 }
 
-export function error(message) {
+export function error(...args) {
     const timestamp = new Date().toISOString();
+    const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
     const formatted = `[${timestamp}] ERROR: ${message}`;
-    console.error(message);
+    console.error(...args);
     fs.appendFileSync(LOG_FILE, formatted + '\n');
 }
 

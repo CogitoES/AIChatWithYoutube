@@ -238,8 +238,8 @@ export async function getTranscriptChunks(urlOrId, targetLength = 1500, overlapL
     // 1. Try to load from local storage
     let data = loadVideoData(videoId);
 
-    if (!data) {
-        console.log(`Transcript not found in cache for ${videoId}. Fetching...`);
+    if (!data || data.transcription === undefined) {
+        console.log(`Transcript not found in cache for ${videoId} (either empty or metadata-only cache). Fetching full details...`);
         data = await getVideoDetails(videoId);
         saveVideoData(videoId, data);
     } else {
